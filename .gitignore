@@ -45,6 +45,12 @@ frontend/dist/
 # Project-local temp or sample workspaces not intended for release
 tempwails/
 
+# Process docs and non-release materials
+tests/
+docs/requirements/
+plans/
+需求文档.md
+
 # IDE or package manager noise
 npm-debug.log*
 yarn-debug.log*
