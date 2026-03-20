@@ -348,4 +348,4 @@ wails doctor
 
 ## 许可证
 
-当前仓库尚未声明许可证。开源发布前建议补充 `LICENSE` 文件并明确许可协议。
+本项目基于 [`MIT License`](LICENSE) 开源发布，完整协议内容见根目录下的 [`LICENSE`](LICENSE) 文件。
