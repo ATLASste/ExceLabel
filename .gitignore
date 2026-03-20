@@ -48,6 +48,7 @@ tempwails/
 # Process docs and non-release materials
 tests/
 docs/requirements/
+docs/management/github-upload-guide.md
 plans/
 需求文档.md
 
