@@ -1,0 +1,1162 @@
+# ExceLabel 详细设计
+
+## 1. 设计目标
+
+基于 [`需求文档.md`](../需求文档.md) ，本设计面向一个以 Windows 本地桌面环境为主的文件与 Excel 双向同步工具。目标是在 Go + Wails 技术栈下，形成可落地的系统架构、模块边界、数据结构、同步机制与异常处理方案，供后续 [`Code`](../需求文档.md) 模式直接实施。
+
+本设计优先满足以下目标：
+
+1. 递归扫描目标目录，生成 Excel 文件清单
+2. 支持 Excel 修改文件名后回写到文件系统
+3. 支持文件系统外部变更后回写到 Excel
+4. 避免覆盖、误改、循环同步与性能抖动
+5. 在数千文件规模下保持界面流畅与同步稳定
+
+---
+
+## 2. 设计范围与关键假设
+
+### 2.1 设计范围
+
+本设计覆盖：
+
+- 桌面端总体架构
+- 前后端职责划分
+- 扫描、导出、同步、冲突处理流程
+- 数据模型与接口边界
+- Excel 工作簿结构设计
+- 文件监听与事件合并策略
+- 错误处理、日志与测试方案
+
+本设计暂不覆盖：
+
+- Office 插件开发
+- 云同步
+- 多用户并发编辑同一 Excel
+- 非 Windows 平台特性适配细节
+
+### 2.2 关键假设
+
+1. 首版以 Windows 为主要目标平台
+2. 用户通过本工具生成并管理一个受控工作簿
+3. Excel 侧编辑检测以 工作簿文件保存后重新比对 为主，而非真正捕获 Excel 单元格失焦事件
+4. 文件规模为数千级，允许采用内存索引 + 增量扫描 + 事件去抖方案
+5. 首版优先保证 文件重命名同步 稳定，移动目录与删除的处理以自动更新或标记为主
+
+### 2.3 关键约束
+
+Excel 原生桌面应用对外部程序并不直接暴露通用的单元格失焦事件。基于 [`excelize`](../需求文档.md) 的方案更适合处理工作簿文件本身，而非直接监听 Excel 进程中的实时编辑行为。
+
+因此，详细设计采用以下折中方案：
+
+- Excel -> 文件系统：监听目标工作簿文件变更事件，在用户保存 Excel 后执行差异计算与重命名同步
+- 文件系统 -> Excel：监听根目录文件变化，增量更新工作簿内容与状态列
+
+这与 [`需求文档.md`](../需求文档.md) 中 实时或批量同步 的要求一致，但具体实时粒度落在 保存后秒级响应。
+
+---
+
+## 3. 总体架构设计
+
+### 3.1 分层架构
+
+系统采用四层结构：
+
+1. 表现层
+   - Wails 前端界面
+   - 负责路径选择、状态展示、操作触发、日志查看
+2. 应用层
+   - 编排扫描、导出、同步、刷新、恢复等用例
+   - 管理任务队列、事件分发、并发控制
+3. 领域层
+   - 定义文件记录、工作簿行、同步事件、冲突结果等核心模型
+   - 封装命名规则、冲突判定、状态机等核心业务逻辑
+4. 基础设施层
+   - 文件扫描器
+   - Excel 适配器
+   - 文件监听器
+   - 本地状态存储
+   - Windows 路径规则处理
+
+### 3.2 总体组件图
+
+```mermaid
+flowchart LR
+    UI[Wails 界面] --> APP[应用服务层]
+    APP --> SCAN[文件扫描器]
+    APP --> WB[Excel 适配器]
+    APP --> WATCH[文件监听器]
+    APP --> STORE[状态存储]
+    SCAN --> ROOT[目标目录]
+    WATCH --> ROOT
+    WB --> XLSX[工作簿]
+    STORE --> CACHE[内存索引]
+```
+
+### 3.3 运行时核心协作
+
+```mermaid
+flowchart TD
+    START[启动任务] --> LOAD[加载配置与快照]
+    LOAD --> FULLSCAN[初始扫描]
+    FULLSCAN --> EXPORT[导出工作簿]
+    EXPORT --> WATCHFS[监听目标目录]
+    EXPORT --> WATCHXLSX[监听工作簿]
+    WATCHFS --> RECON[事件合并与增量对账]
+    WATCHXLSX --> DIFF[工作簿差异分析]
+    DIFF --> RENAME[执行重命名]
+    RECON --> UPDATE[回写 Excel]
+    RENAME --> UPDATE
+    UPDATE --> IDLE[空闲等待]
+    IDLE --> WATCHFS
+    IDLE --> WATCHXLSX
+```
+
+---
+
+## 4. 目录与模块设计
+
+建议后续工程结构如下：
+
+```text
+cmd/excelabel/
+internal/app/
+internal/domain/
+internal/infrastructure/scanner/
+internal/infrastructure/workbook/
+internal/infrastructure/fswatch/
+internal/infrastructure/store/
+internal/infrastructure/logging/
+internal/presentation/wails/
+frontend/src/
+plans/
+```
+
+### 4.1 模块职责
+
+#### [`cmd/excelabel/main.go`](../plans/详细设计.md)
+应用入口，负责初始化配置、日志、Wails 应用与后台服务。
+
+#### [`internal/app`](../plans/详细设计.md)
+负责用例编排：
+
+- `StartWorkspace`
+- `ScanAndExport`
+- `HandleWorkbookChanged`
+- `HandleFilesystemChanged`
+- `ApplyRenameBatch`
+- `RefreshWorkbook`
+
+#### [`internal/domain`](../plans/详细设计.md)
+负责纯业务规则：
+
+- 文件记录模型
+- 行状态机
+- 非法字符过滤
+- 冲突判断
+- 差异计算结果定义
+
+#### [`internal/infrastructure/scanner`](../plans/详细设计.md)
+负责高性能扫描目标目录，输出统一 `FileEntry` 集合。
+
+#### [`internal/infrastructure/workbook`](../plans/详细设计.md)
+负责通过 [`excelize`](../需求文档.md) 读写工作簿、隐藏元数据列、状态着色、工作表保护与快照比较。
+
+#### [`internal/infrastructure/fswatch`](../plans/详细设计.md)
+负责通过 [`fsnotify`](../需求文档.md) 监听目录与工作簿变更，并做事件去抖与聚合。
+
+#### [`internal/infrastructure/store`](../plans/详细设计.md)
+负责保存本地快照、操作日志、配置与上次同步版本。
+
+#### [`internal/presentation/wails`](../plans/详细设计.md)
+负责把应用层能力暴露给前端，并接收前端触发的操作命令。
+
+#### [`frontend/src`](../plans/详细设计.md)
+负责路径选择、任务状态卡片、日志面板、冲突列表、手动刷新与手动同步入口。
+
+---
+
+## 5. Excel 工作簿设计
+
+### 5.1 工作簿结构
+
+建议工作簿包含两个工作表：
+
+1. `Files`
+   - 面向用户展示与编辑
+2. `_meta`
+   - 隐藏工作表，用于保存全局版本、导出时间、工作区配置等元信息
+
+### 5.2 `Files` 表设计
+
+| 列 | 字段 | 可见 | 可编辑 | 说明 |
+| --- | --- | --- | --- | --- |
+| A | NameStem | 是 | 是 | 不含后缀的文件名 |
+| B | Ext | 是 | 否 | 文件扩展名 |
+| C | RelativeDir | 是 | 否 | 相对根目录子路径 |
+| D | Status | 是 | 否 | 同步状态与错误信息 |
+| E | RecordID | 否 | 否 | 行级稳定主键 |
+| F | FileFingerprint | 否 | 否 | 文件指纹 |
+| G | LastKnownPath | 否 | 否 | 上次同步时的相对路径 |
+| H | RowVersion | 否 | 否 | 行版本号 |
+| I | Tombstone | 否 | 否 | 删除标记 |
+| J | LastOpSource | 否 | 否 | 最近变更来源 |
+
+### 5.3 设计原因
+
+1. A 到 C 保持与 [`需求文档.md`](../需求文档.md) 一致
+2. D 列提供用户可见的结果反馈
+3. E 到 J 隐藏列保证排序、筛选后仍能保持行与文件的稳定映射
+4. 通过锁定 B C D E F G H I J 列，仅允许 A 列编辑，可降低误操作
+
+### 5.4 工作簿保护策略
+
+- 默认允许编辑 A 列
+- 默认锁定 B C D 及隐藏列
+- 使用颜色规则标记状态：
+  - 正常 同步成功 为绿色
+  - 待处理 为黄色
+  - 冲突 为红色
+  - 已删除 为灰色
+
+---
+
+## 6. 核心数据结构设计
+
+以下为建议的核心结构，不是实现代码，而是后续接口设计依据。
+
+### 6.1 文件记录
+
+```text
+FileEntry
+- RecordID string
+- NameStem string
+- Ext string
+- RelativeDir string
+- AbsolutePath string
+- Fingerprint string
+- Size int64
+- ModTime time
+- Exists bool
+- LastSeenVersion int64
+```
+
+说明：
+
+- `RecordID` 为系统分配的稳定标识，不依赖行号
+- `Fingerprint` 用于重命名和移动的关联识别
+- `RelativeDir + NameStem + Ext` 组成逻辑路径
+
+### 6.2 工作簿行快照
+
+```text
+WorkbookRow
+- RowIndex int
+- RecordID string
+- NameStem string
+- Ext string
+- RelativeDir string
+- Status string
+- Fingerprint string
+- LastKnownPath string
+- RowVersion int64
+- Tombstone bool
+- LastOpSource string
+```
+
+### 6.3 同步事件
+
+```text
+SyncEvent
+- EventID string
+- Source EventSource
+- Type EventType
+- RecordID string
+- OldPath string
+- NewPath string
+- OccurredAt time
+- CorrelationKey string
+```
+
+### 6.4 冲突结果
+
+```text
+ConflictResult
+- RecordID string
+- ConflictType string
+- TargetPath string
+- Reason string
+- Suggestion string
+```
+
+### 6.5 工作区状态
+
+```text
+WorkspaceState
+- RootDir string
+- WorkbookPath string
+- SnapshotVersion int64
+- LastScanAt time
+- LastWorkbookHash string
+- Entries map
+- PendingEvents list
+```
+
+---
+
+## 7. 关键业务规则设计
+
+### 7.1 文件身份识别规则
+
+不能只依赖文件路径识别同一文件，否则一旦重命名，原记录会断裂。
+
+首版建议采用两级识别：
+
+1. 主标识：`RecordID`
+   - 首次导出时生成并写入 Excel 隐藏列
+2. 辅助识别：`Fingerprint`
+   - 由 文件大小 + 修改时间 + 局部内容哈希 组成
+   - 用于重命名或外部移动后的关联恢复
+
+### 7.2 重命名合法性规则
+
+在执行 Excel -> 文件系统同步前，必须校验：
+
+1. 名称非空
+2. 不包含 Windows 非法字符
+3. 不以空格或点结尾
+4. 目标完整路径长度不超过系统约束
+5. 同目录下目标文件不存在
+6. 后缀名不可由 A 列变更间接破坏
+
+### 7.3 路径生成规则
+
+最终目标路径由以下规则组成：
+
+`RootDir + RelativeDir + NameStem + Ext`
+
+其中：
+
+- `RelativeDir` 以工作簿记录值为准，但首版不允许用户在 Excel 侧修改 C 列
+- `Ext` 保持只读，避免用户误改扩展名导致文件类型错配
+
+### 7.4 循环同步防护规则
+
+系统执行重命名后，文件监听器也会收到文件系统事件。为避免重复处理，必须引入循环防护：
+
+1. 每次内部操作生成 `CorrelationKey`
+2. 写入最近操作缓存，设置短时间有效窗口
+3. 文件监听收到事件后，若命中内部操作缓存，则标记为内部回声事件并忽略二次同步
+
+---
+
+## 8. 双向同步详细流程设计
+
+## 8.1 初始扫描与导出流程
+
+```mermaid
+sequenceDiagram
+    participant UI as 界面
+    participant APP as 应用层
+    participant SCAN as 扫描器
+    participant WB as 工作簿
+    participant STORE as 状态存储
+
+    UI->>APP: 选择目录并开始
+    APP->>SCAN: 全量扫描
+    SCAN-->>APP: FileEntry 集合
+    APP->>WB: 生成或覆盖工作簿
+    APP->>STORE: 保存快照
+    APP-->>UI: 返回统计结果
+```
+
+步骤：
+
+1. 用户选择根目录与工作簿输出路径
+2. 扫描器递归遍历并并发收集文件元数据
+3. 应用层构建 `FileEntry` 集合
+4. 工作簿适配器写入 `Files` 表与 `_meta` 表
+5. 状态存储持久化快照与版本号
+6. 启动文件系统监听与工作簿监听
+
+## 8.2 Excel -> 文件系统同步流程
+
+触发条件：用户修改 Excel 中 A 列并保存工作簿。
+
+```mermaid
+sequenceDiagram
+    participant WATCH as 工作簿监听
+    participant APP as 应用层
+    participant WB as 工作簿适配器
+    participant DOMAIN as 领域规则
+    participant FS as 文件系统
+    participant STORE as 状态存储
+
+    WATCH->>APP: 工作簿已变化
+    APP->>WB: 读取当前工作簿
+    WB-->>APP: WorkbookRow 集合
+    APP->>DOMAIN: 比较快照差异
+    DOMAIN-->>APP: 待重命名清单
+    APP->>DOMAIN: 校验冲突与非法字符
+    APP->>FS: 执行 rename
+    APP->>WB: 回写状态列
+    APP->>STORE: 更新快照
+```
+
+详细步骤：
+
+1. 监听器检测到工作簿文件修改，启动 300 到 800 毫秒去抖
+2. 重新读取 `Files` 表
+3. 按 `RecordID` 与旧快照对比：
+   - 若 A 列变化，则识别为重命名请求
+   - 若行缺失，则识别为手工删除行，首版不直接删除文件，仅写状态警告
+   - 若 B C 隐藏列被破坏，则写入错误状态并拒绝该行同步
+4. 对每个重命名请求做合法性与冲突校验
+5. 按目录分组顺序执行 `rename`
+6. 将结果回写到 D 列状态
+7. 更新隐藏列中的 `LastKnownPath` `RowVersion` `LastOpSource`
+8. 持久化新快照
+
+## 8.3 文件系统 -> Excel 同步流程
+
+触发条件：目标目录发生新增、删除、重命名、移动或外部修改。
+
+```mermaid
+sequenceDiagram
+    participant WATCH as 文件监听
+    participant APP as 应用层
+    participant SCAN as 增量扫描
+    participant DOMAIN as 差异分析
+    participant WB as 工作簿适配器
+    participant STORE as 状态存储
+
+    WATCH->>APP: 文件系统事件
+    APP->>APP: 事件聚合去抖
+    APP->>SCAN: 扫描受影响目录
+    SCAN-->>APP: 最新文件视图
+    APP->>DOMAIN: 与快照对账
+    DOMAIN-->>APP: 新增 删除 重命名结果
+    APP->>WB: 增量更新工作簿
+    APP->>STORE: 更新快照
+```
+
+设计重点：
+
+1. 不对每个底层事件直接改 Excel，而是按批次聚合后统一处理
+2. 对重命名的识别优先使用 `Fingerprint` 关联
+3. 无法确认是重命名还是 删除加新增 时：
+   - 旧行标记为 已删除
+   - 新文件新增一行
+4. 若文件被占用、无法读取，则写入状态列并等待下一轮刷新恢复
+
+## 8.4 状态机设计
+
+```mermaid
+stateDiagram-v2
+    [*] --> Synced
+    Synced --> PendingExcelChange
+    Synced --> PendingFsChange
+    PendingExcelChange --> ApplyingRename
+    ApplyingRename --> Synced
+    ApplyingRename --> Conflict
+    ApplyingRename --> Error
+    PendingFsChange --> Reconciling
+    Reconciling --> Synced
+    Reconciling --> Deleted
+    Reconciling --> Error
+    Conflict --> Synced
+    Error --> Synced
+    Deleted --> Synced
+```
+
+状态说明：
+
+- `Synced` 已同步
+- `PendingExcelChange` 检测到 Excel 编辑待应用
+- `PendingFsChange` 检测到文件系统变化待对账
+- `ApplyingRename` 正在执行重命名
+- `Reconciling` 正在增量对账
+- `Conflict` 发生命名冲突或非法命名
+- `Error` 发生不可恢复错误
+- `Deleted` 文件已删除或已移除
+
+---
+
+## 9. 冲突处理与异常处理设计
+
+### 9.1 冲突类型
+
+1. 目标文件已存在
+2. 文件名非法
+3. 文件被占用无法重命名
+4. 工作簿元数据损坏
+5. Excel 与文件系统同时修改同一记录
+6. 监听事件风暴导致快照过期
+
+### 9.2 冲突处理策略
+
+| 冲突类型 | 处理策略 | 用户可见反馈 |
+| --- | --- | --- |
+| 目标文件已存在 | 拒绝重命名 | D 列标红并显示已存在 |
+| 非法字符 | 拒绝重命名或按配置替换 | D 列显示非法字符 |
+| 文件占用 | 重试有限次后失败 | D 列显示文件被占用 |
+| 元数据损坏 | 跳过该行并要求刷新 | D 列显示元数据异常 |
+| 双端同时修改 | 以最新事件时间 + 版本比较处理，冲突则人工确认 | D 列显示双向冲突 |
+| 快照过期 | 触发一次局部或全量刷新 | 日志区域显示已自动修复 |
+
+### 9.3 异常处理原则
+
+1. 单行失败不阻塞整个批次
+2. 所有失败都必须写入 D 列或日志面板
+3. 不允许因为同步失败导致工作簿整体损坏
+4. 无法保证正确性时优先保守处理，即标记冲突而非盲目覆盖
+
+---
+
+## 10. 性能设计
+
+### 10.1 扫描性能
+
+- 使用 goroutine worker pool 并发扫描
+- 限制并发度，避免磁盘抖动
+- 对大目录采用分目录任务队列
+- 初始扫描构建内存索引 `map RecordID -> FileEntry`
+
+### 10.2 监听性能
+
+- 目录事件统一进入缓冲通道
+- 按路径聚合并去抖
+- 同一时间窗口只执行一次增量对账
+- 超过阈值时退化为局部目录重扫或全量重扫
+
+### 10.3 Excel 写入性能
+
+- 批量更新单元格，避免逐格频繁刷写
+- 对状态列优先采用区域写入
+- 仅在确有变化时保存工作簿
+- 对大量状态更新使用内存构造后一次性保存
+
+### 10.4 UI 性能
+
+- 前端仅展示聚合统计与分页日志
+- 长任务通过事件流上报进度
+- 所有耗时逻辑都在 Go 后端执行，避免阻塞 Wails 前端线程
+
+---
+
+## 11. 接口边界设计
+
+以下为推荐接口，不是代码实现。
+
+### 11.1 扫描接口
+
+```text
+Scanner
+- ScanFull rootDir -> list FileEntry
+- ScanPaths rootDir paths -> list FileEntry
+```
+
+### 11.2 工作簿接口
+
+```text
+WorkbookRepository
+- CreateWorkbook workbookPath entries
+- LoadRows workbookPath -> list WorkbookRow
+- UpdateRows workbookPath changes
+- WriteStatuses workbookPath statuses
+- ProtectSheet workbookPath
+```
+
+### 11.3 监听接口
+
+```text
+Watcher
+- WatchRoot rootDir
+- WatchWorkbook workbookPath
+- Events -> channel SyncEvent
+- Close
+```
+
+### 11.4 状态存储接口
+
+```text
+StateStore
+- LoadWorkspace rootDir -> WorkspaceState
+- SaveWorkspace state
+- SaveSnapshot version entries
+- LoadSnapshot -> list FileEntry
+```
+
+### 11.5 应用服务接口
+
+```text
+SyncService
+- StartWorkspace rootDir workbookPath
+- RefreshNow
+- ApplyWorkbookChanges
+- ApplyFilesystemChanges
+- GetStatusSummary
+```
+
+---
+
+## 12. 前端页面结构与交互流程详细设计
+
+### 12.1 页面目标
+
+前端基于 Wails 提供单窗口桌面应用界面，核心目标不是直接承载 Excel 编辑，而是提供 工作区配置、同步状态观察、异常处理入口 与 手动控制能力。
+
+前端页面需满足以下原则：
+
+1. 用户首次打开即可完成 根目录选择、工作簿创建或绑定、启动同步
+2. 用户可以清晰看见 当前工作区、监听状态、文件统计、最近变更、冲突项
+3. 自动同步存在风险时，用户能够通过显式按钮执行 刷新、重试、打开工作簿、打开目录
+4. 所有后台任务都要有过程反馈，避免界面无响应感
+5. 页面风格遵循 [`需求文档.md`](../需求文档.md) 中的浅色现代化 Mica / Acrylic 方向
+
+### 12.2 页面信息架构
+
+建议单窗口采用 五区布局：
+
+1. 顶部标题栏区
+2. 左侧工作区与操作导航区
+3. 中央状态与文件概览区
+4. 右侧冲突与任务详情区
+5. 底部日志与事件流区
+
+```mermaid
+flowchart TB
+    APP[应用主窗口]
+    APP --> TOP[顶部标题栏]
+    APP --> BODY[主工作区]
+    APP --> BOTTOM[底部日志区]
+    BODY --> LEFT[左侧控制区]
+    BODY --> CENTER[中央信息区]
+    BODY --> RIGHT[右侧冲突区]
+```
+
+### 12.3 页面结构拆分
+
+#### 12.3.1 顶部标题栏
+
+功能组成：
+
+- 应用名称与当前工作区名称
+- 当前同步状态徽标
+- 全局操作按钮
+  - 启动监听
+  - 停止监听
+  - 立即刷新
+  - 打开工作簿
+  - 设置
+- 窗口级状态提示
+  - 最近同步时间
+  - 当前运行模式 自动同步 或 手动同步
+
+状态展示建议：
+
+- `空闲` 使用中性浅灰色
+- `监听中` 使用绿色
+- `同步中` 使用蓝绿色或青色
+- `告警` 使用橙色
+- `错误` 使用红色
+
+#### 12.3.2 左侧控制区
+
+功能组成：
+
+1. 工作区配置卡片
+   - 根目录输入框
+   - 浏览目录按钮
+   - 工作簿路径输入框
+   - 新建工作簿按钮
+   - 绑定现有工作簿按钮
+2. 同步策略卡片
+   - 自动同步开关
+   - Excel 保存触发开关说明
+   - 文件系统监听开关说明
+   - 去抖时间配置入口
+3. 快捷操作卡片
+   - 扫描并导出
+   - 只刷新 Excel
+   - 只刷新文件系统索引
+   - 清理状态
+4. 统计摘要卡片
+   - 文件总数
+   - 待处理数
+   - 冲突数
+   - 失败数
+
+左侧区域承担 配置 与 主操作入口，不承载大体量数据明细。
+
+#### 12.3.3 中央信息区
+
+中央信息区建议分为上下两段：
+
+上段为 概览卡片区：
+
+- 文件总数卡片
+- 已同步卡片
+- 待处理卡片
+- 冲突卡片
+- 失败卡片
+- 最近一次扫描耗时卡片
+
+下段为 文件变化概览区：
+
+- 最近同步批次摘要
+- 最近新增文件列表
+- 最近重命名成功列表
+- 最近删除或缺失文件列表
+- 最近失败操作列表
+
+该区域重点是帮助用户快速理解 当前系统正在发生什么，而不是替代 Excel 表格本身。
+
+#### 12.3.4 右侧冲突与详情区
+
+该区域采用标签页或上下分区结构：
+
+1. 冲突列表
+   - 目标文件已存在
+   - 文件名非法
+   - 元数据损坏
+   - 文件被占用
+   - 双向冲突
+2. 当前任务详情
+   - 当前执行阶段
+   - 已处理数量
+   - 队列剩余数量
+   - 受影响路径列表
+3. 选中项详情
+   - RecordID
+   - 原路径
+   - 目标路径
+   - 冲突原因
+   - 建议处理动作
+
+建议支持对冲突项执行：
+
+- 复制错误详情
+- 打开对应文件夹
+- 重新校验
+- 忽略本次
+- 标记待人工处理
+
+#### 12.3.5 底部日志区
+
+底部采用可折叠日志面板，显示：
+
+- 时间
+- 来源模块
+- 操作类型
+- 结果
+- 简要说明
+
+日志面板支持：
+
+- 按级别筛选
+- 按 RecordID 或路径搜索
+- 展开查看完整错误栈或上下文
+- 导出日志文件
+
+### 12.4 页面状态模型
+
+前端页面建议维护以下视图状态：
+
+```text
+ViewState
+- WorkspaceReady bool
+- SyncMode string
+- WatcherStatus string
+- CurrentJob string
+- Summary StatisticsView
+- RecentActivities list
+- Conflicts list
+- Logs list
+- SelectedConflictID string
+- LastSyncAt time
+- IsBusy bool
+- ErrorBanner string
+```
+
+设计原则：
+
+1. 前端以只读投影为主，避免复制业务逻辑
+2. 所有真实状态以 Go 后端应用层为准
+3. 前端仅维护选择态、展开态、筛选态与轻量缓存
+
+### 12.5 核心交互流程设计
+
+#### 12.5.1 首次进入与工作区初始化
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant UI as 前端界面
+    participant APP as 应用层
+
+    U->>UI: 选择根目录
+    U->>UI: 选择新建或绑定工作簿
+    UI->>APP: 初始化工作区
+    APP-->>UI: 返回配置校验结果
+    U->>UI: 点击扫描并导出
+    UI->>APP: 启动全量扫描
+    APP-->>UI: 推送进度
+    APP-->>UI: 返回完成结果与监听状态
+```
+
+交互规则：
+
+1. 未选择根目录前，主要操作按钮置灰
+2. 路径非法时，在输入框下方即时展示错误文案
+3. 初始化成功后，中央概览区从空状态切换为统计视图
+4. 首次导出完成后，弹出轻提示，提供 打开工作簿 与 开始监听 两个动作
+
+#### 12.5.2 Excel 保存后触发同步
+
+```mermaid
+sequenceDiagram
+    participant WATCH as 工作簿监听
+    participant APP as 应用层
+    participant UI as 前端界面
+
+    WATCH->>APP: 检测到工作簿已保存
+    APP-->>UI: 推送状态 同步中
+    APP-->>UI: 推送进度与受影响项数量
+    APP-->>UI: 推送成功 失败 冲突结果
+    APP-->>UI: 推送状态 空闲或告警
+```
+
+交互规则：
+
+1. 标题栏状态切换为 `同步中`
+2. 中央概览区实时刷新 成功数 冲突数 失败数
+3. 右侧冲突区自动滚动到最新冲突
+4. 若全部成功，仅显示轻量成功提示，不打断用户
+5. 若存在冲突，显示可关闭告警条，并突出 D 列状态解释
+
+#### 12.5.3 文件系统外部变化后回写 Excel
+
+交互规则：
+
+1. 当监听到新增 删除 重命名时，不对用户弹大量通知
+2. 页面仅在中央概览区增加 最近变化统计，并在底部日志中追加记录
+3. 若变化导致 Excel 回写失败，才提升为右侧冲突项和顶部告警
+4. 若短时间事件过多，标题栏显示 `高频更新处理中`
+
+#### 12.5.4 手动刷新与恢复操作
+
+手动恢复动作包括：
+
+- 立即全量刷新
+- 仅重试失败项
+- 重新生成工作簿
+- 重新绑定工作簿
+- 停止并重启监听
+
+交互规则：
+
+1. 高风险操作前弹确认框
+2. 重新生成工作簿时明确提示 可能覆盖状态列与元数据
+3. 全量刷新期间禁用重复触发按钮
+4. 恢复成功后自动清空已解决的告警项
+
+### 12.6 页面组件清单
+
+建议前端最小组件集合如下：
+
+- `AppShell`
+- `TitleBar`
+- `WorkspaceConfigPanel`
+- `SyncControlPanel`
+- `SummaryCards`
+- `ActivityFeed`
+- `ConflictPanel`
+- `TaskDetailPanel`
+- `LogConsole`
+- `StatusBadge`
+- `EmptyState`
+- `ConfirmDialog`
+- `ToastCenter`
+
+### 12.7 页面空状态设计
+
+在以下场景下需要专门的空状态文案与视觉占位：
+
+1. 尚未选择工作区
+2. 已选择工作区但尚未导出工作簿
+3. 当前无冲突项
+4. 当前无日志
+5. 当前无最近活动
+
+空状态设计原则：
+
+- 明确下一步行动按钮
+- 文案简短，避免技术术语堆积
+- 空状态图形使用轻量文件夹、表格、同步图标组合
+
+### 12.8 页面异常提示层级
+
+为了避免通知轰炸，提示采用四级机制：
+
+1. 轻提示 Toast
+   - 成功导出
+   - 同步完成
+   - 打开路径成功
+2. 内联提示 Inline Message
+   - 配置项缺失
+   - 去抖设置不合理
+3. 顶部告警 Banner
+   - 工作簿损坏
+   - 监听器异常退出
+   - 冲突数量持续增加
+4. 模态框 Dialog
+   - 重新生成工作簿
+   - 覆盖危险操作
+   - 停止监听并退出工作区
+
+### 12.9 页面视觉与交互风格约束
+
+结合 [`需求文档.md`](../需求文档.md) 中的 UI 要求，建议前端遵循以下风格：
+
+- 主背景为高亮浅色灰白体系
+- 卡片使用半透明白底与柔和边框
+- 使用轻阴影和模糊材质表达层级
+- 主强调色采用低饱和青绿或青灰，而非高饱和纯蓝
+- 字体与图标风格保持简洁、偏专业工具感
+- 表单与按钮圆角统一，避免过于尖锐或过于拟物
+
+### 12.10 前后端交互事件建议
+
+前端建议通过 Wails 绑定以下事件或命令：
+
+```text
+UI Commands
+- SelectRootDir
+- SelectWorkbookPath
+- InitializeWorkspace
+- ScanAndExport
+- StartWatching
+- StopWatching
+- RefreshNow
+- RetryFailedItems
+- RebuildWorkbook
+- OpenWorkbook
+- OpenRootDir
+
+Backend Events
+- WorkspaceInitialized
+- ScanStarted
+- ScanProgress
+- ScanCompleted
+- SyncStarted
+- SyncProgress
+- SyncCompleted
+- ConflictDetected
+- WatcherStatusChanged
+- LogAppended
+- FatalErrorOccurred
+```
+
+### 12.11 前端实施优先级
+
+推荐前端按以下顺序落地：
+
+1. `AppShell` 与整体布局框架
+2. 工作区配置区与路径选择流程
+3. 顶部标题栏与状态徽标
+4. 中央概览卡片与基础统计
+5. 底部日志区
+6. 右侧冲突区与详情区
+7. Toast Banner Dialog 等反馈组件
+8. 设置面板与高级配置
+
+### 12.12 前端验收标准
+
+前端设计完成后，应至少满足以下验收点：
+
+1. 用户无需阅读文档即可完成首次工作区初始化
+2. 用户能在 3 次视线切换内识别 当前状态 是否正常
+3. 用户能快速定位 冲突项 在哪里、为什么发生、如何处理
+4. 长时间同步任务过程中界面没有假死感
+5. 自动同步、手动刷新、冲突处理三类动作入口清晰且不互相混淆
+6. 页面视觉风格与 [`需求文档.md`](../需求文档.md) 的现代浅色桌面风格保持一致
+
+## 13. 配置设计
+
+建议配置项如下：
+
+```text
+AppConfig
+- RootDir
+- WorkbookPath
+- AutoSyncEnabled
+- WorkbookDebounceMs
+- FsDebounceMs
+- MaxScanWorkers
+- ConflictPolicy
+- InvalidCharPolicy
+- LogLevel
+```
+
+### 13.1 默认策略建议
+
+- `AutoSyncEnabled`: true
+- `WorkbookDebounceMs`: 500
+- `FsDebounceMs`: 800
+- `MaxScanWorkers`: 按 CPU 与磁盘类型自适应
+- `ConflictPolicy`: reject
+- `InvalidCharPolicy`: reject_first_version
+
+---
+
+## 14. 日志与可观测性设计
+
+### 14.1 日志级别
+
+- Info：扫描开始、扫描完成、同步成功
+- Warn：冲突、非法字符、元数据异常
+- Error：文件占用、保存失败、监听异常
+
+### 14.2 日志输出位置
+
+- UI 日志面板
+- 本地日志文件
+- 可选控制台输出 开发模式
+
+### 14.3 关键指标
+
+- 文件总数
+- 最近全量扫描耗时
+- 最近增量同步耗时
+- 成功重命名数
+- 冲突数
+- 失败数
+- 当前监听状态
+
+---
+
+## 15. 测试设计
+
+### 15.1 单元测试
+
+重点验证：
+
+- 名称合法性校验
+- 文件指纹计算
+- 行差异识别
+- 冲突检测
+- 状态机转换
+
+### 15.2 集成测试
+
+重点验证：
+
+1. 全量扫描后工作簿生成正确
+2. 修改 A 列并保存后文件正确重命名
+3. 外部重命名文件后工作簿自动更新
+4. 目标重名时写入冲突状态
+5. 非法字符输入被拦截
+6. 监听事件风暴下系统不会重复写入或死循环
+
+### 15.3 人工验收场景
+
+1. 空目录
+2. 多层嵌套目录
+3. 数千文件目录
+4. 包含中文、空格、长文件名路径
+5. 文件被其他程序占用
+6. 用户手动排序或筛选 Excel 行
+7. 工作簿被外部损坏或隐藏列被误删
+
+---
+
+## 16. 风险与设计决策说明
+
+### 16.1 最大技术风险
+
+最大风险不在文件扫描，而在 Excel 编辑行为的外部感知能力。
+
+若坚持 用户失焦即同步，需要引入以下增强方案之一：
+
+1. Office COM 自动化
+2. Excel VSTO 插件
+3. Office JS 加载项
+
+这会显著增加实现复杂度，并偏离 [`需求文档.md`](../需求文档.md) 当前建议栈。
+
+因此首版设计明确采用 工作簿保存触发同步。该方案简单、稳定、可维护，适合先完成核心业务闭环。
+
+### 16.2 记录身份稳定性风险
+
+如果只靠路径识别，重命名后无法准确追踪同一文件，因此必须保留隐藏元数据列与本地快照。
+
+### 16.3 fsnotify 精度风险
+
+不同编辑器和文件管理器对重命名、覆盖保存的事件模式不同。设计中已经通过 事件去抖 + 增量重扫 + 快照对账 降低底层事件差异风险。
+
+---
+
+## 17. 后续实施建议
+
+### 17.1 推荐实施顺序
+
+1. 建立 Wails + Go 工程骨架
+2. 实现配置加载与路径选择
+3. 实现全量扫描器
+4. 实现 Excel 导出与隐藏列结构
+5. 实现本地快照存储
+6. 实现工作簿保存触发的 Excel -> 文件系统同步
+7. 实现文件系统监听与 Excel 回写
+8. 实现冲突面板、日志面板与状态展示
+9. 实现测试与异常恢复机制
+
+### 17.2 最小可用版本范围
+
+最小可用版本建议先支持：
+
+- 目录扫描
+- Excel 导出
+- 修改 A 列后保存触发重命名
+- 冲突检测
+- 手动刷新
+
+在此基础上再加入 文件系统 -> Excel 自动回写。
+
+---
+
+## 18. 实施检查清单
+
+1. 创建 Wails 应用骨架与基础目录结构
+2. 定义 [`internal/domain`](../plans/详细设计.md) 中的核心模型与状态枚举
+3. 实现配置模型、工作区模型与本地状态存储
+4. 实现并发文件扫描器与文件指纹生成逻辑
+5. 实现工作簿创建器，输出 `Files` 与 `_meta` 工作表
+6. 实现 `Files` 表隐藏列、状态列与工作表保护策略
+7. 实现全量扫描后导出工作簿与保存初始快照
+8. 实现工作簿文件监听、去抖与保存后差异分析
+9. 实现 A 列改名检测、合法性校验与冲突检测
+10. 实现 Excel -> 文件系统批量重命名流程
+11. 实现重命名结果回写 D 列状态与日志记录
+12. 实现文件系统监听器与事件聚合机制
+13. 实现受影响目录增量扫描与快照对账逻辑
+14. 实现 文件系统 -> Excel 的新增、删除、重命名更新策略
+15. 实现循环同步防护与内部操作相关键追踪
+16. 实现前端状态卡片、日志面板、手动刷新与开始停止监听按钮
+17. 实现错误展示、冲突展示与恢复提示
+18. 补充单元测试、集成测试与人工验收脚本
+19. 完成性能调优、异常恢复与发布前验收
+
+---
+
+## 19. 结论
+
+本设计在不引入 Office 插件的前提下，给出了一套可落地的 ExceLabel 双向同步详细方案。核心原则是：
+
+- 用受控工作簿承载用户编辑入口
+- 用隐藏元数据列和本地快照保证记录稳定性
+- 用保存触发与文件监听实现双向同步
+- 用事件去抖、快照对账与循环防护保证稳定性
+- 用状态列和日志面板保证可观察与可恢复
+
+该方案已经具备切换到实现阶段的条件。
