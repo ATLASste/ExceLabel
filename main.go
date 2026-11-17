@@ -25,13 +25,18 @@ func main() {
 	app := presentation.NewDesktopApp(service)
 
 	err := wails.Run(&options.App{
-		Title:  "ExceLabel",
-		Width:  1640,
-		Height: 1000,
+		Title:       "ExceLabel",
+		Width:       1640,
+		Height:      1000,
+		MinWidth:    presentation.MinWindowWidth,
+		MinHeight:   presentation.MinWindowHeight,
+		StartHidden: true,
 		AssetServer: &assetserver.Options{
 			Assets: assets,
 		},
-		OnStartup: app.Startup,
+		OnStartup:     app.Startup,
+		OnDomReady:    app.DomReady,
+		OnBeforeClose: app.BeforeClose,
 		Bind: []interface{}{
 			app,
 		},

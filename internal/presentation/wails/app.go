@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"excelabel/internal/app"
 
@@ -14,8 +15,9 @@ import (
 )
 
 type DesktopApp struct {
-	ctx     context.Context
-	service *app.SyncService
+	ctx      context.Context
+	service  *app.SyncService
+	showOnce sync.Once
 }
 
 func NewDesktopApp(service *app.SyncService) *DesktopApp {

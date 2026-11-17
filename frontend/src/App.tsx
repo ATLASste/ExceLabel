@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
   ApplyWorkbookChanges,
   GetStatusSummary,
@@ -49,6 +49,43 @@ const initialSummary: StatusSummary = {
 
 type WorkbookMode = 'create' | 'existing' | ''
 
+type PathInputProps = {
+  value: string
+  onChange: (value: string) => void
+  placeholder: string
+}
+
+// Scrolls to the end of the path whenever the input is not being edited, so
+// the file or folder name stays visible.
+function PathInput({ value, onChange, placeholder }: PathInputProps) {
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  const scrollToEnd = () => {
+    const input = inputRef.current
+    if (input && document.activeElement !== input) {
+      input.scrollLeft = input.scrollWidth
+    }
+  }
+
+  useLayoutEffect(scrollToEnd, [value])
+
+  useEffect(() => {
+    window.addEventListener('resize', scrollToEnd)
+    return () => window.removeEventListener('resize', scrollToEnd)
+  }, [])
+
+  return (
+    <input
+      ref={inputRef}
+      value={value}
+      title={value}
+      onChange={(event) => onChange(event.target.value)}
+      onBlur={scrollToEnd}
+      placeholder={placeholder}
+    />
+  )
+}
+
 function App() {
   const [rootDir, setRootDir] = useState('')
   const [workbookPath, setWorkbookPath] = useState('')
@@ -74,7 +111,7 @@ function App() {
         title: '待人工处理',
         text:
           summary.conflicts.length > 0
-            ? `当前存在 ${summary.conflicts.length} 个冲突项，已写入工作簿 D 列。`
+            ? `当前存在 ${summary.conflicts.length} 个冲突项，请查看下方详情。`
             : '当前没有待处理冲突。',
       },
     ],
@@ -252,7 +289,7 @@ function App() {
             <label>
               根目录
               <div className="input-with-action">
-                <input value={rootDir} onChange={(event) => setRootDir(event.target.value)} placeholder="请选择需要扫描的目录" />
+                <PathInput value={rootDir} onChange={setRootDir} placeholder="请选择需要扫描的目录" />
                 <button className="ghost-btn inline-btn" onClick={pickRootDirectory} disabled={busy}>
                   选择目录
                 </button>
@@ -260,9 +297,9 @@ function App() {
             </label>
             <label>
               工作簿路径
-              <input
+              <PathInput
                 value={workbookPath}
-                onChange={(event) => setWorkbookPath(event.target.value)}
+                onChange={setWorkbookPath}
                 placeholder="新建或选择现有 Excel 工作簿后会显示在这里"
               />
             </label>
@@ -393,7 +430,10 @@ function App() {
           <section className="usage-tip-panel glass-card">
             <h2>使用提示</h2>
             <div className="setting-item setting-item-multiline usage-tip-list">
-              <div className="usage-tip-item">• 在 Excel 中改名并保存后点击“应用 Excel 修改”。</div>
+              <div className="usage-tip-item">• 在 Excel 中修改 B 列并保存后点击“应用 Excel 修改”。</div>
+              <div className="usage-tip-item">• 新工作簿按目录和扩展名分组；筛选各一项后，确认行号连续再下拉公式。</div>
+              <div className="usage-tip-item">• 行号不连续时，选中 B 列范围并按 Alt+;，同行公式可用 Ctrl+Enter 填充。</div>
+              <div className="usage-tip-item">• 请勿排序、插入或移动数据行，以免文件关联错位。</div>
               <div className="usage-tip-item">• 磁盘变化后点击“同步文件状态”。</div>
               <div className="usage-tip-item">• 应用同步文件状态前需要关闭对应工作簿。</div>
             </div>

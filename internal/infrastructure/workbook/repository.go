@@ -12,8 +12,10 @@ import (
 )
 
 const (
-	filesSheet = "Files"
-	metaSheet  = "_meta"
+	filesSheet         = "Files"
+	metaSheet          = "_meta"
+	originalNameHeader = "原文件名"
+	nameStemHeader     = "NameStem (在此修改)"
 )
 
 type Repository struct{}
@@ -62,6 +64,10 @@ func (repository *Repository) LoadRows(workbookPath string) ([]domain.WorkbookRo
 	}
 	defer func() { _ = file.Close() }()
 
+	columnOffset, err := filesColumnOffset(file)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := file.GetRows(filesSheet)
 	if err != nil {
 		return nil, fmt.Errorf("read files sheet rows: %w", err)
@@ -80,12 +86,23 @@ func (repository *Repository) LoadRows(workbookPath string) ([]domain.WorkbookRo
 		rowIndex := index + 1
 		row := rows[index]
 		metadata := metadataByRow[rowIndex]
+		nameAxis, err := excelize.CoordinatesToCellName(columnOffset+1, rowIndex)
+		if err != nil {
+			return nil, fmt.Errorf("build name cell axis: %w", err)
+		}
+		cellType, err := file.GetCellType(filesSheet, nameAxis)
+		if err != nil {
+			return nil, fmt.Errorf("read name cell type %s: %w", nameAxis, err)
+		}
+		if cellType == excelize.CellTypeError {
+			return nil, fmt.Errorf("工作簿 %s 单元格计算出错（%s），请修正公式并重新计算、保存", nameAxis, cell(row, columnOffset))
+		}
 		result = append(result, domain.WorkbookRow{
 			RowIndex:      rowIndex,
-			NameStem:      cell(row, 0),
-			Ext:           cell(row, 1),
-			RelativeDir:   cell(row, 2),
-			Status:        cell(row, 3),
+			NameStem:      cell(row, columnOffset),
+			Ext:           cell(row, columnOffset+1),
+			RelativeDir:   cell(row, columnOffset+2),
+			Status:        cell(row, columnOffset+3),
 			RecordID:      metadata.RecordID,
 			Fingerprint:   metadata.Fingerprint,
 			LastKnownPath: metadata.LastKnownPath,
@@ -105,6 +122,10 @@ func (repository *Repository) WriteStatuses(workbookPath string, rows []domain.W
 	}
 	defer func() { _ = file.Close() }()
 
+	columnOffset, err := filesColumnOffset(file)
+	if err != nil {
+		return err
+	}
 	styles, err := buildStyles(file)
 	if err != nil {
 		return err
@@ -115,7 +136,10 @@ func (repository *Repository) WriteStatuses(workbookPath string, rows []domain.W
 	}
 
 	for _, row := range rows {
-		axis := fmt.Sprintf("D%d", row.RowIndex)
+		axis, err := excelize.CoordinatesToCellName(columnOffset+4, row.RowIndex)
+		if err != nil {
+			return fmt.Errorf("build status cell axis: %w", err)
+		}
 		if err := file.SetCellValue(filesSheet, axis, row.Status); err != nil {
 			return fmt.Errorf("write status %s: %w", axis, err)
 		}
@@ -162,8 +186,40 @@ func (repository *Repository) UpdateRows(workbookPath string, rows []domain.Work
 	return repository.CreateWorkbook(workbookPath, rows, state)
 }
 
+func filesColumnOffset(file *excelize.File) (int, error) {
+	firstHeader, err := file.GetCellValue(filesSheet, "A1")
+	if err != nil {
+		return 0, fmt.Errorf("read files sheet header A1: %w", err)
+	}
+
+	var offset int
+	switch firstHeader {
+	case originalNameHeader:
+		offset = 1
+	case nameStemHeader:
+		offset = 0
+	default:
+		return 0, fmt.Errorf("无法识别工作簿列格式：请勿修改 Files 工作表表头")
+	}
+
+	for index, expected := range []string{nameStemHeader, "Ext", "RelativeDir", "Status"} {
+		axis, err := excelize.CoordinatesToCellName(index+offset+1, 1)
+		if err != nil {
+			return 0, fmt.Errorf("build header axis: %w", err)
+		}
+		actual, err := file.GetCellValue(filesSheet, axis)
+		if err != nil {
+			return 0, fmt.Errorf("read header %s: %w", axis, err)
+		}
+		if actual != expected {
+			return 0, fmt.Errorf("无法识别工作簿列格式：%s 应为 %q，实际为 %q", axis, expected, actual)
+		}
+	}
+	return offset, nil
+}
+
 func writeHeaders(file *excelize.File) error {
-	headers := []string{"NameStem (在此修改)", "Ext", "RelativeDir", "Status"}
+	headers := []string{originalNameHeader, nameStemHeader, "Ext", "RelativeDir", "Status"}
 	for index, header := range headers {
 		axis, err := excelize.CoordinatesToCellName(index+1, 1)
 		if err != nil {
@@ -178,7 +234,7 @@ func writeHeaders(file *excelize.File) error {
 
 func writeRows(file *excelize.File, rows []domain.WorkbookRow) error {
 	for _, row := range rows {
-		values := []any{row.NameStem, row.Ext, row.RelativeDir, row.Status}
+		values := []any{row.NameStem, row.NameStem, row.Ext, row.RelativeDir, row.Status}
 		for index, value := range values {
 			axis, err := excelize.CoordinatesToCellName(index+1, row.RowIndex)
 			if err != nil {
@@ -284,11 +340,11 @@ func applyLayout(file *excelize.File, rows []domain.WorkbookRow) error {
 	if err := file.SetSheetVisible(metaSheet, false); err != nil {
 		return fmt.Errorf("hide meta sheet: %w", err)
 	}
-	if err := file.SetCellStyle(filesSheet, "A1", "A1", styles.headerPrimaryStyle); err != nil {
-		return fmt.Errorf("apply primary header style: %w", err)
-	}
-	if err := file.SetCellStyle(filesSheet, "B1", "D1", styles.headerStyle); err != nil {
+	if err := file.SetCellStyle(filesSheet, "A1", "E1", styles.headerStyle); err != nil {
 		return fmt.Errorf("apply header style: %w", err)
+	}
+	if err := file.SetCellStyle(filesSheet, "B1", "B1", styles.headerPrimaryStyle); err != nil {
+		return fmt.Errorf("apply primary header style: %w", err)
 	}
 
 	dataEndRow := len(rows) + 1
@@ -298,12 +354,12 @@ func applyLayout(file *excelize.File, rows []domain.WorkbookRow) error {
 	if err := file.SetPanes(filesSheet, &excelize.Panes{Freeze: true, Split: false, XSplit: 0, YSplit: 1, TopLeftCell: "A2", ActivePane: "bottomLeft"}); err != nil {
 		return fmt.Errorf("freeze header row: %w", err)
 	}
-	filterRange := fmt.Sprintf("A1:D%d", dataEndRow)
+	filterRange := fmt.Sprintf("A1:E%d", dataEndRow)
 	if err := file.AutoFilter(filesSheet, filterRange, []excelize.AutoFilterOptions{}); err != nil {
 		return fmt.Errorf("set auto filter: %w", err)
 	}
 	for _, row := range rows {
-		axis := fmt.Sprintf("D%d", row.RowIndex)
+		axis := fmt.Sprintf("E%d", row.RowIndex)
 		if err := applyStatusCellStyle(file, axis, row.Status, styles); err != nil {
 			return fmt.Errorf("apply initial status style %s: %w", axis, err)
 		}
@@ -359,18 +415,20 @@ func buildStyles(file *excelize.File) (workbookStyles, error) {
 
 func applyVisibleColumnWidths(file *excelize.File, rows []domain.WorkbookRow) error {
 	widths := map[string]float64{
-		"A": estimateColumnWidth("NameStem (在此修改)"),
-		"B": estimateColumnWidth("Ext"),
-		"C": estimateColumnWidth("RelativeDir"),
-		"D": estimateColumnWidth("Status"),
+		"A": estimateColumnWidth(originalNameHeader),
+		"B": estimateColumnWidth(nameStemHeader),
+		"C": estimateColumnWidth("Ext"),
+		"D": estimateColumnWidth("RelativeDir"),
+		"E": estimateColumnWidth("Status"),
 	}
 	for _, row := range rows {
 		widths["A"] = maxWidth(widths["A"], estimateColumnWidth(row.NameStem))
-		widths["B"] = maxWidth(widths["B"], estimateColumnWidth(row.Ext))
-		widths["C"] = maxWidth(widths["C"], estimateColumnWidth(row.RelativeDir))
-		widths["D"] = maxWidth(widths["D"], estimateColumnWidth(row.Status))
+		widths["B"] = maxWidth(widths["B"], estimateColumnWidth(row.NameStem))
+		widths["C"] = maxWidth(widths["C"], estimateColumnWidth(row.Ext))
+		widths["D"] = maxWidth(widths["D"], estimateColumnWidth(row.RelativeDir))
+		widths["E"] = maxWidth(widths["E"], estimateColumnWidth(row.Status))
 	}
-	for _, column := range []string{"A", "B", "C", "D"} {
+	for _, column := range []string{"A", "B", "C", "D", "E"} {
 		if err := file.SetColWidth(filesSheet, column, column, widths[column]); err != nil {
 			return fmt.Errorf("set width for column %s: %w", column, err)
 		}

@@ -266,7 +266,24 @@ func SnapshotRows(entries map[string]FileEntry, snapshotVersion int64) []Workboo
 	}
 
 	sort.Slice(sortedEntries, func(i, j int) bool {
-		return strings.ToLower(sortedEntries[i].LogicalPath()) < strings.ToLower(sortedEntries[j].LogicalPath())
+		left, right := sortedEntries[i], sortedEntries[j]
+		leftDir := strings.ToLower(NormalizeRelativeDir(left.RelativeDir))
+		rightDir := strings.ToLower(NormalizeRelativeDir(right.RelativeDir))
+		if leftDir != rightDir {
+			return leftDir < rightDir
+		}
+		leftExt, rightExt := strings.ToLower(left.Ext), strings.ToLower(right.Ext)
+		if leftExt != rightExt {
+			return leftExt < rightExt
+		}
+		leftPath, rightPath := left.LogicalPath(), right.LogicalPath()
+		if leftLower, rightLower := strings.ToLower(leftPath), strings.ToLower(rightPath); leftLower != rightLower {
+			return leftLower < rightLower
+		}
+		if leftPath != rightPath {
+			return leftPath < rightPath
+		}
+		return left.RecordID < right.RecordID
 	})
 
 	rows := make([]WorkbookRow, 0, len(sortedEntries))
